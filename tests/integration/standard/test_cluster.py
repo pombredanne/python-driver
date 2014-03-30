@@ -4,11 +4,11 @@ except ImportError:
     import unittest # noqa
 
 import cassandra
-from cassandra.query import SimpleStatement
-from cassandra.io.asyncorereactor import AsyncoreConnection
+from cassandra.query import SimpleStatement, TraceUnavailable
 from cassandra.policies import RoundRobinPolicy, ExponentialReconnectionPolicy, RetryPolicy, SimpleConvictionPolicy, HostDistance
 
 from cassandra.cluster import Cluster, NoHostAvailable
+
 
 class ClusterTests(unittest.TestCase):
 
@@ -69,6 +69,12 @@ class ClusterTests(unittest.TestCase):
         result2 = session2.execute("SELECT * FROM test")
         self.assertEquals(result, result2)
 
+    def test_set_keyspace_twice(self):
+        cluster = Cluster()
+        session = cluster.connect()
+        session.execute("USE system")
+        session.execute("USE system")
+
     def test_default_connections(self):
         """
         Ensure errors are not thrown when using non-default policies
@@ -78,8 +84,7 @@ class ClusterTests(unittest.TestCase):
             load_balancing_policy=RoundRobinPolicy(),
             reconnection_policy=ExponentialReconnectionPolicy(1.0, 600.0),
             default_retry_policy=RetryPolicy(),
-            conviction_policy_factory=SimpleConvictionPolicy,
-            connection_class=AsyncoreConnection
+            conviction_policy_factory=SimpleConvictionPolicy
         )
 
     def test_double_shutdown(self):
@@ -94,7 +99,7 @@ class ClusterTests(unittest.TestCase):
             cluster.shutdown()
             self.fail('A double cluster.shutdown() should throw an error.')
         except Exception as e:
-            self.assertEqual(e.message, 'The Cluster was already shutdown')
+            self.assertIn('The Cluster was already shutdown', str(e))
 
     def test_connect_to_already_shutdown_cluster(self):
         """
@@ -187,10 +192,17 @@ class ClusterTests(unittest.TestCase):
 
         self.assertRaises(TypeError, session.execute, "SELECT * FROM system.local", trace=True)
 
+        def check_trace(trace):
+            self.assertIsNot(None, trace.request_type)
+            self.assertIsNot(None, trace.duration)
+            self.assertIsNot(None, trace.started_at)
+            self.assertIsNot(None, trace.coordinator)
+            self.assertIsNot(None, trace.events)
+
         query = "SELECT * FROM system.local"
         statement = SimpleStatement(query)
         session.execute(statement, trace=True)
-        self.assertEqual(query, statement.trace.parameters['query'])
+        check_trace(statement.trace)
 
         query = "SELECT * FROM system.local"
         statement = SimpleStatement(query)
@@ -200,12 +212,27 @@ class ClusterTests(unittest.TestCase):
         statement2 = SimpleStatement(query)
         future = session.execute_async(statement2, trace=True)
         future.result()
-        self.assertEqual(query, future.get_query_trace().parameters['query'])
+        check_trace(future.get_query_trace())
 
         statement2 = SimpleStatement(query)
         future = session.execute_async(statement2)
         future.result()
         self.assertEqual(None, future.get_query_trace())
+
+        prepared = session.prepare("SELECT * FROM system.local")
+        future = session.execute_async(prepared, parameters=(), trace=True)
+        future.result()
+        check_trace(future.get_query_trace())
+
+    def test_trace_timeout(self):
+        cluster = Cluster()
+        session = cluster.connect()
+
+        query = "SELECT * FROM system.local"
+        statement = SimpleStatement(query)
+        future = session.execute_async(statement, trace=True)
+        future.result()
+        self.assertRaises(TraceUnavailable, future.get_query_trace, -1.0)
 
     def test_string_coverage(self):
         """

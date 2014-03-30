@@ -1,8 +1,15 @@
 import errno
 from functools import wraps, partial
 import logging
+import sys
 from threading import Event, RLock
-from Queue import Queue
+import time
+import traceback
+
+if 'gevent.monkey' in sys.modules:
+    from gevent.queue import Queue
+else:
+    from Queue import Queue  # noqa
 
 from cassandra import ConsistencyLevel, AuthenticationFailed, OperationTimedOut
 from cassandra.marshal import int8_unpack, int32_pack
@@ -74,7 +81,7 @@ class ConnectionException(Exception):
 
 class ConnectionShutdown(ConnectionException):
     """
-    Raised when a connection has been defuncted or closed.
+    Raised when a connection has been marked as defunct or has been closed.
     """
     pass
 
@@ -104,6 +111,9 @@ def defunct_on_error(f):
             self.defunct(exc)
 
     return wrapper
+
+
+DEFAULT_CQL_VERSION = '3.0.0'
 
 
 class Connection(object):
@@ -146,16 +156,99 @@ class Connection(object):
         raise NotImplementedError()
 
     def defunct(self, exc):
-        raise NotImplementedError()
+        with self.lock:
+            if self.is_defunct or self.is_closed:
+                return
+            self.is_defunct = True
 
-    def send_msg(self, msg, cb):
-        raise NotImplementedError()
+        trace = traceback.format_exc(exc)
+        if trace != "None":
+            log.debug("Defuncting connection (%s) to %s: %s\n%s",
+                      id(self), self.host, exc, traceback.format_exc(exc))
+        else:
+            log.debug("Defuncting connection (%s) to %s: %s", id(self), self.host, exc)
 
-    def wait_for_response(self, msg, **kwargs):
-        raise NotImplementedError()
+        self.last_error = exc
+        self.close()
+        self.error_all_callbacks(exc)
+        self.connected_event.set()
+        return exc
+
+    def error_all_callbacks(self, exc):
+        with self.lock:
+            callbacks = self._callbacks
+            self._callbacks = {}
+        new_exc = ConnectionShutdown(str(exc))
+        for cb in callbacks.values():
+            try:
+                cb(new_exc)
+            except Exception:
+                log.warn("Ignoring unhandled exception while erroring callbacks for a "
+                         "failed connection (%s) to host %s:",
+                         id(self), self.host, exc_info=True)
+
+    def handle_pushed(self, response):
+        log.debug("Message pushed from server: %r", response)
+        for cb in self._push_watchers.get(response.event_type, []):
+            try:
+                cb(response.event_args)
+            except Exception:
+                log.exception("Pushed event handler errored, ignoring:")
+
+    def send_msg(self, msg, cb, wait_for_id=False):
+        if self.is_defunct:
+            raise ConnectionShutdown("Connection to %s is defunct" % self.host)
+        elif self.is_closed:
+            raise ConnectionShutdown("Connection to %s is closed" % self.host)
+
+        if not wait_for_id:
+            try:
+                request_id = self._id_queue.get_nowait()
+            except Queue.Empty:
+                raise ConnectionBusy(
+                    "Connection to %s is at the max number of requests" % self.host)
+        else:
+            request_id = self._id_queue.get()
+
+        self._callbacks[request_id] = cb
+        self.push(msg.to_string(request_id, compression=self.compressor))
+        return request_id
+
+    def wait_for_response(self, msg, timeout=None):
+        return self.wait_for_responses(msg, timeout=timeout)[0]
 
     def wait_for_responses(self, *msgs, **kwargs):
-        raise NotImplementedError()
+        timeout = kwargs.get('timeout')
+        waiter = ResponseWaiter(self, len(msgs))
+
+        # busy wait for sufficient space on the connection
+        messages_sent = 0
+        while True:
+            needed = len(msgs) - messages_sent
+            with self.lock:
+                available = min(needed, MAX_STREAM_PER_CONNECTION - self.in_flight)
+                self.in_flight += available
+
+            for i in range(messages_sent, messages_sent + available):
+                self.send_msg(msgs[i], partial(waiter.got_response, index=i), wait_for_id=True)
+            messages_sent += available
+
+            if messages_sent == len(msgs):
+                break
+            else:
+                if timeout is not None:
+                    timeout -= 0.01
+                    if timeout <= 0.0:
+                        raise OperationTimedOut()
+                time.sleep(0.01)
+
+        try:
+            return waiter.deliver(timeout)
+        except OperationTimedOut:
+            raise
+        except Exception, exc:
+            self.defunct(exc)
+            raise
 
     def register_watcher(self, event_type, callback):
         raise NotImplementedError()
@@ -211,8 +304,16 @@ class Connection(object):
 
     @defunct_on_error
     def _send_options_message(self):
-        log.debug("Sending initial options message for new connection (%s) to %s", id(self), self.host)
-        self.send_msg(OptionsMessage(), self._handle_options_response)
+        if self.cql_version is None and (not self.compression or not locally_supported_compressions):
+            log.debug("Not sending options message for new connection(%s) to %s "
+                      "because compression is disabled and a cql version was not "
+                      "specified", id(self), self.host)
+            self._compressor = None
+            self.cql_version = DEFAULT_CQL_VERSION
+            self._send_startup_message()
+        else:
+            log.debug("Sending initial options message for new connection (%s) to %s", id(self), self.host)
+            self.send_msg(OptionsMessage(), self._handle_options_response)
 
     @defunct_on_error
     def _handle_options_response(self, options_response):
@@ -220,41 +321,53 @@ class Connection(object):
             return
 
         if not isinstance(options_response, SupportedMessage):
-            log.error("Did not get expected SupportedMessage response; instead, got: %s", options_response)
-            raise ConnectionException("Did not get expected SupportedMessage response; instead, got: %s" % (options_response,))
+            if isinstance(options_response, ConnectionException):
+                raise options_response
+            else:
+                log.error("Did not get expected SupportedMessage response; " \
+                          "instead, got: %s", options_response)
+                raise ConnectionException("Did not get expected SupportedMessage " \
+                                          "response; instead, got: %s" \
+                                          % (options_response,))
 
         log.debug("Received options response on new connection (%s) from %s",
                   id(self), self.host)
-        self.supported_cql_versions = options_response.cql_versions
-        self.remote_supported_compressions = options_response.options['COMPRESSION']
+        supported_cql_versions = options_response.cql_versions
+        remote_supported_compressions = options_response.options['COMPRESSION']
 
         if self.cql_version:
-            if self.cql_version not in self.supported_cql_versions:
+            if self.cql_version not in supported_cql_versions:
                 raise ProtocolError(
                     "cql_version %r is not supported by remote (w/ native "
                     "protocol). Supported versions: %r"
-                    % (self.cql_version, self.supported_cql_versions))
+                    % (self.cql_version, supported_cql_versions))
         else:
-            self.cql_version = self.supported_cql_versions[0]
+            self.cql_version = supported_cql_versions[0]
 
-        opts = {}
         self._compressor = None
+        compression_type = None
         if self.compression:
             overlap = (set(locally_supported_compressions.keys()) &
-                       set(self.remote_supported_compressions))
+                       set(remote_supported_compressions))
             if len(overlap) == 0:
                 log.debug("No available compression types supported on both ends."
                           " locally supported: %r. remotely supported: %r",
                           locally_supported_compressions.keys(),
-                          self.remote_supported_compressions)
+                          remote_supported_compressions)
             else:
                 compression_type = iter(overlap).next()  # choose any
-                opts['COMPRESSION'] = compression_type
                 # set the decompressor here, but set the compressor only after
                 # a successful Ready message
                 self._compressor, self.decompressor = \
                     locally_supported_compressions[compression_type]
 
+        self._send_startup_message(compression_type)
+
+    @defunct_on_error
+    def _send_startup_message(self, compression=None):
+        opts = {}
+        if compression:
+            opts['COMPRESSION'] = compression
         sm = StartupMessage(cqlversion=self.cql_version, options=opts)
         self.send_msg(sm, cb=self._handle_startup_response)
 
@@ -305,14 +418,18 @@ class Connection(object):
             # the keyspace probably doesn't exist
             raise ire.to_exception()
         except Exception as exc:
-            raise self.defunct(ConnectionException(
-                "Problem while setting keyspace: %r" % (exc,), self.host))
+            conn_exc = ConnectionException(
+                "Problem while setting keyspace: %r" % (exc,), self.host)
+            self.defunct(conn_exc)
+            raise conn_exc
 
         if isinstance(result, ResultMessage):
             self.keyspace = keyspace
         else:
-            raise self.defunct(ConnectionException(
-                "Problem while setting keyspace: %r" % (result,), self.host))
+            conn_exc = ConnectionException(
+                "Problem while setting keyspace: %r" % (result,), self.host)
+            self.defunct(conn_exc)
+            raise conn_exc
 
     def set_keyspace_async(self, keyspace, callback):
         """
@@ -322,6 +439,7 @@ class Connection(object):
         occurred, otherwise :const:`None`.
         """
         if not keyspace or keyspace == self.keyspace:
+            callback(self, None)
             return
 
         query = QueryMessage(query='USE "%s"' % (keyspace,),
@@ -352,13 +470,16 @@ class Connection(object):
 
 class ResponseWaiter(object):
 
-    def __init__(self, num_responses):
+    def __init__(self, connection, num_responses):
+        self.connection = connection
         self.pending = num_responses
         self.error = None
         self.responses = [None] * num_responses
         self.event = Event()
 
     def got_response(self, response, index):
+        with self.connection.lock:
+            self.connection.in_flight -= 1
         if isinstance(response, Exception):
             self.error = response
             self.event.set()

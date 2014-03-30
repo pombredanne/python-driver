@@ -7,6 +7,7 @@ from mock import Mock, ANY
 
 from concurrent.futures import ThreadPoolExecutor
 
+from cassandra import OperationTimedOut
 from cassandra.decoder import ResultMessage
 from cassandra.cluster import ControlConnection, Cluster, _Scheduler
 from cassandra.pool import Host
@@ -14,6 +15,7 @@ from cassandra.policies import (SimpleConvictionPolicy, RoundRobinPolicy,
                                 ConstantReconnectionPolicy)
 
 PEER_IP = "foobar"
+
 
 class MockMetadata(object):
 
@@ -47,6 +49,8 @@ class MockCluster(object):
     load_balancing_policy = RoundRobinPolicy()
     reconnection_policy = ConstantReconnectionPolicy(2)
     down_host = None
+    contact_points = []
+    _is_shutdown = False
 
     def __init__(self):
         self.metadata = MockMetadata()
@@ -55,8 +59,8 @@ class MockCluster(object):
         self.scheduler = Mock(spec=_Scheduler)
         self.executor = Mock(spec=ThreadPoolExecutor)
 
-    def add_host(self, address, signal=False):
-        host = Host(address, SimpleConvictionPolicy)
+    def add_host(self, address, datacenter, rack, signal=False):
+        host = Host(address, SimpleConvictionPolicy, datacenter, rack)
         self.added_hosts.append(host)
         return host
 
@@ -87,7 +91,7 @@ class MockConnection(object):
              ["192.168.1.2", "10.0.0.2", "a", "dc1", "rack1", ["2", "102", "202"]]]
         ]
 
-    def wait_for_responses(self, peer_query, local_query):
+    def wait_for_responses(self, peer_query, local_query, timeout=None):
         local_response = ResultMessage(
             kind=ResultMessage.KIND_ROWS, results=self.local_results)
         peer_response = ResultMessage(
@@ -114,7 +118,7 @@ class ControlConnectionTest(unittest.TestCase):
         self.connection = MockConnection()
         self.time = FakeTime()
 
-        self.control_connection = ControlConnection(self.cluster)
+        self.control_connection = ControlConnection(self.cluster, timeout=0.01)
         self.control_connection._connection = self.connection
         self.control_connection._time = self.time
 
@@ -208,6 +212,7 @@ class ControlConnectionTest(unittest.TestCase):
         self.connection.peer_results[1].append(
             ["192.168.1.3", "10.0.0.3", "a", "dc1", "rack1", ["3", "103", "203"]]
         )
+        self.cluster.scheduler.schedule = lambda delay, f, *args, **kwargs: f(*args, **kwargs)
         self.control_connection.refresh_node_list_and_token_map()
         self.assertEqual(1, len(self.cluster.added_hosts))
         self.assertEqual(self.cluster.added_hosts[0].address, "192.168.1.3")
@@ -220,13 +225,33 @@ class ControlConnectionTest(unittest.TestCase):
         self.assertEqual(1, len(self.cluster.removed_hosts))
         self.assertEqual(self.cluster.removed_hosts[0].address, "192.168.1.2")
 
+    def test_refresh_nodes_and_tokens_timeout(self):
+
+        def bad_wait_for_responses(*args, **kwargs):
+            self.assertEqual(kwargs['timeout'], self.control_connection._timeout)
+            raise OperationTimedOut()
+
+        self.connection.wait_for_responses = bad_wait_for_responses
+        self.control_connection.refresh_node_list_and_token_map()
+        self.cluster.executor.submit.assert_called_with(self.control_connection._reconnect)
+
+    def test_refresh_schema_timeout(self):
+
+        def bad_wait_for_responses(*args, **kwargs):
+            self.assertEqual(kwargs['timeout'], self.control_connection._timeout)
+            raise OperationTimedOut()
+
+        self.connection.wait_for_responses = bad_wait_for_responses
+        self.control_connection.refresh_schema()
+        self.cluster.executor.submit.assert_called_with(self.control_connection._reconnect)
+
     def test_handle_topology_change(self):
         event = {
             'change_type': 'NEW_NODE',
             'address': ('1.2.3.4', 9000)
         }
         self.control_connection._handle_topology_change(event)
-        self.cluster.scheduler.schedule.assert_called_with(ANY, self.cluster.add_host, '1.2.3.4', signal=True)
+        self.cluster.scheduler.schedule.assert_called_with(ANY, self.control_connection.refresh_node_list_and_token_map)
 
         event = {
             'change_type': 'REMOVED_NODE',
@@ -248,7 +273,7 @@ class ControlConnectionTest(unittest.TestCase):
             'address': ('1.2.3.4', 9000)
         }
         self.control_connection._handle_status_change(event)
-        self.cluster.scheduler.schedule.assert_called_with(ANY, self.cluster.add_host, '1.2.3.4', signal=True)
+        self.cluster.scheduler.schedule.assert_called_with(ANY, self.control_connection.refresh_node_list_and_token_map)
 
         # do the same with a known Host
         event = {

@@ -3,6 +3,7 @@ Connection pooling and host management.
 """
 
 import logging
+import socket
 import time
 from threading import RLock, Condition
 import weakref
@@ -37,11 +38,16 @@ class Host(object):
 
     conviction_policy = None
     """
-    A class:`ConvictionPolicy` instance for determining when this node should
+    A :class:`~.ConvictionPolicy` instance for determining when this node should
     be marked up or down.
     """
 
     is_up = None
+    """
+    :const:`True` if the node is considered up, :const:`False` if it is
+    considered down, and :const:`None` if it is not known if the node is
+    up or down.
+    """
 
     _datacenter = None
     _rack = None
@@ -51,7 +57,7 @@ class Host(object):
     _currently_handling_node_up = False
     _handle_node_up_condition = None
 
-    def __init__(self, inet_address, conviction_policy_factory):
+    def __init__(self, inet_address, conviction_policy_factory, datacenter=None, rack=None):
         if inet_address is None:
             raise ValueError("inet_address may not be None")
         if conviction_policy_factory is None:
@@ -59,6 +65,7 @@ class Host(object):
 
         self.address = inet_address
         self.conviction_policy = conviction_policy_factory(self)
+        self.set_location_info(datacenter, rack)
         self.lock = RLock()
         self._handle_node_up_condition = Condition()
 
@@ -82,6 +89,8 @@ class Host(object):
         self._rack = rack
 
     def set_up(self):
+        if not self.is_up:
+            log.debug("Host %s is now marked up", self.address)
         self.conviction_policy.reset()
         self.is_up = True
 
@@ -105,9 +114,6 @@ class Host(object):
             return old
 
     def __eq__(self, other):
-        if not isinstance(other, Host):
-            return False
-
         return self.address == other.address
 
     def __str__(self):
@@ -159,7 +165,8 @@ class _ReconnectionHandler(object):
                 self.on_reconnection(conn)
                 self.callback(*(self.callback_args), **(self.callback_kwargs))
         finally:
-            conn.close()
+            if conn:
+                conn.close()
 
     def cancel(self):
         self._cancelled = True
@@ -228,7 +235,7 @@ class _HostReconnectionHandler(_ReconnectionHandler):
 
 
 _MAX_SIMULTANEOUS_CREATION = 1
-_MIN_TRASH_INTERVAL = 5
+_MIN_TRASH_INTERVAL = 10
 
 
 class HostConnectionPool(object):
@@ -297,30 +304,32 @@ class HostConnectionPool(object):
             # trashing it (through the return_connection process), hold
             # the connection lock from this point until we've incremented
             # its in_flight count
+            need_to_wait = False
             with least_busy.lock:
-
-                # if we have too many requests on this connection but we still
-                # have space to open a new connection against this host, go ahead
-                # and schedule the creation of a new connection
-                if least_busy.in_flight >= max_reqs and len(self._connections) < max_conns:
-                    self._maybe_spawn_new_connection()
 
                 if least_busy.in_flight >= MAX_STREAM_PER_CONNECTION:
                     # once we release the lock, wait for another connection
                     need_to_wait = True
                 else:
-                    need_to_wait = False
                     least_busy.in_flight += 1
 
             if need_to_wait:
                 # wait_for_conn will increment in_flight on the conn
                 least_busy = self._wait_for_conn(timeout)
 
+            # if we have too many requests on this connection but we still
+            # have space to open a new connection against this host, go ahead
+            # and schedule the creation of a new connection
+            if least_busy.in_flight >= max_reqs and len(self._connections) < max_conns:
+                self._maybe_spawn_new_connection()
+
             return least_busy
 
     def _maybe_spawn_new_connection(self):
         with self._lock:
             if self._scheduled_for_creation >= _MAX_SIMULTANEOUS_CREATION:
+                return
+            if self.open_count >= self._session.cluster.get_max_connections_per_host(self.host_distance):
                 return
             self._scheduled_for_creation += 1
 
@@ -330,6 +339,8 @@ class HostConnectionPool(object):
     def _create_new_connection(self):
         try:
             self._add_conn_if_under_max()
+        except (ConnectionException, socket.error), exc:
+            log.warn("Failed to create new connection to %s: %s", self.host, exc)
         except Exception:
             log.exception("Unexpectedly failed to create new connection")
         finally:
@@ -347,6 +358,7 @@ class HostConnectionPool(object):
 
             self.open_count += 1
 
+        log.debug("Going to open new connection to host %s", self.host)
         try:
             conn = self._session.cluster.connection_factory(self.host.address)
             if self._session.keyspace:
@@ -359,8 +371,8 @@ class HostConnectionPool(object):
                       id(conn), self.host)
             self._signal_available_conn()
             return True
-        except ConnectionException as exc:
-            log.exception("Failed to add new connection to pool for host %s", self.host)
+        except (ConnectionException, socket.error) as exc:
+            log.warn("Failed to add new connection to pool for host %s: %s", self.host, exc)
             with self._lock:
                 self.open_count -= 1
             if self._session.cluster.signal_connection_failure(self.host, exc, is_host_addition=False):
@@ -507,6 +519,9 @@ class HostConnectionPool(object):
             conn.close()
             self.open_count -= 1
 
+        for conn in self._trash:
+            conn.close()
+
     def ensure_core_connections(self):
         if self.is_shutdown:
             return
@@ -527,6 +542,10 @@ class HostConnectionPool(object):
         remaining_callbacks = set(self._connections)
         errors = []
 
+        if not remaining_callbacks:
+            callback(self, errors)
+            return
+
         def connection_finished_setting_keyspace(conn, error):
             remaining_callbacks.remove(conn)
             if error:
@@ -540,4 +559,4 @@ class HostConnectionPool(object):
 
     def get_state(self):
         in_flights = ", ".join([str(c.in_flight) for c in self._connections])
-        return "shutdown: %s, in_flights: %s" % (self.is_shutdown, in_flights)
+        return "shutdown: %s, open_count: %d, in_flights: %s" % (self.is_shutdown, self.open_count, in_flights)

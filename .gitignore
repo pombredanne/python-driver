@@ -3,6 +3,9 @@
 *.swo
 *.so
 *.egg-info
+.tox
+.idea/
+.python-version
 build
 MANIFEST
 dist
@@ -11,3 +14,5 @@ nosetests.xml
 cover/
 docs/_build/
 tests/integration/ccm
+setuptools*.tar.gz
+setuptools*.egg
